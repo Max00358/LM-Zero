@@ -1,6 +1,6 @@
 import os, re
 import regex
-from pretokenization_example import find_chunk_boundaries
+from .pretokenization_example import find_chunk_boundaries
 
 from collections import Counter
 from collections.abc import Iterable
@@ -100,7 +100,7 @@ def run_train_bpe(
                     if id_seq:
                         corpus.append(id_seq)
     
-    # learn merge until vocab_size
+    # learn merge until vocab_size since merging adds 1 new token into vocab
     while len(id_to_bytes) < vocab_size:
         id_pair_cnts = Counter()
         for seq in corpus:
