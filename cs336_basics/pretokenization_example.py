@@ -1,7 +1,7 @@
 import os
 from typing import BinaryIO
 
-
+# finds boundaries between documents, simply a parallelization helper
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
