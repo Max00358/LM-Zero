@@ -5,7 +5,10 @@ from .pretokenization_example import find_chunk_boundaries
 from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
+from multiprocessing import Pool, cpu_count
 
+# uv run python -m cProfile -o profile.stats -m pytest
+# uv run python -c "import pstats; p = pstats.Stats('profile.stats'); p.sort_stats('cumulative').print_stats(30)"
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -28,6 +31,47 @@ def get_tokenizer(
     """
     raise NotImplementedError
 
+EXT_PAT = None
+EXT_split_pattern = None
+EXT_input_path = None
+EXT_special_tokens_len = 0
+
+def init_worker(
+    PAT: str, 
+    split_pattern: str, 
+    input_path: str,
+    special_tokens_len: int
+):
+    global EXT_PAT, EXT_split_pattern, EXT_input_path, EXT_special_tokens_len
+
+    EXT_PAT = regex.compile(PAT)
+    EXT_split_pattern = regex.compile(split_pattern) if split_pattern else None
+    EXT_input_path = input_path
+    EXT_special_tokens_len = special_tokens_len
+
+def byte2id(byte: int):
+    return EXT_special_tokens_len + byte
+
+def build_corpus_worker(args):
+    start, end = args
+    corpus, docs = [], []
+
+    with open(EXT_input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+
+    # Run pre-tokenization on your chunk and store the counts for each pre-token
+    docs = EXT_split_pattern.split(chunk) if EXT_split_pattern else [chunk]
+
+    for doc in docs:
+        for m in EXT_PAT.finditer(doc):
+            b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
+            id_seq = [byte2id(byte) for byte in b]
+            
+            if id_seq:
+                corpus.append(id_seq)
+
+    return corpus
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -74,31 +118,26 @@ def run_train_bpe(
         curr_id += 1
     
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+"""
-    split_pattern = "|".join(re.escape(token) for token in special_tokens)
-    
+    split_pattern = "|".join(re.escape(token) for token in special_tokens if token)
+    if not split_pattern:
+        split_pattern = None
+    num_processes = max(4, os.cpu_count() or 1)
+
     with open(input_path, "rb") as f:
-        num_processes = max(4, os.cpu_count())
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-
-        # The following is a serial implementation, but you can parallelize this
-        # by sending each start/end pair to a set of processes.
-
-        # say boundaries = [b0, b1, b2, b3], then boundaries[:-1] = [b0, b1, b2], boundaries[1:] = [b1, b2, b3]
+        # if boundaries = [b0, b1, b2, b3], then boundaries[:-1] = [b0, b1, b2], boundaries[1:] = [b1, b2, b3]
         # start, end = (b0 b1), (b1 b2), (b2 b3) consecutive pairs
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            f.seek(start)
-            chunk = f.read(end - start).decode("utf-8", errors="ignore")
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+        num_jobs = list(zip(boundaries[:-1], boundaries[1:]))
 
-            # Run pre-tokenization on your chunk and store the counts for each pre-token
-            docs = re.split(split_pattern, chunk)
-
-            for doc in docs:
-                for m in regex.finditer(PAT, doc):
-                    b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
-                    id_seq = [bytes_to_id[bytes([byte])] for byte in b]
-                    
-                    if id_seq:
-                        corpus.append(id_seq)
+        with Pool(
+            processes=num_processes,
+            initializer=init_worker,
+            initargs=(PAT, split_pattern, input_path, len(special_tokens)),
+        ) as pool:
+            # unordered: results yielded in completion order, not original input order
+            # imap(...): results yielded in input order
+            for seqs in pool.imap_unordered(build_corpus_worker, num_jobs, chunksize=1):
+                corpus.extend(seqs)
     
     # learn merge until vocab_size since merging adds 1 new token into vocab
     while len(id_to_bytes) < vocab_size:
@@ -110,7 +149,7 @@ def run_train_bpe(
             break
 
         (id_a, id_b), _ = id_pair_cnts.most_common(1)[0]
-        new_bytes = bytes([id_a]) + bytes([id_b])
+        new_bytes = id_to_bytes[id_a] + id_to_bytes[id_b]
         if new_bytes in bytes_to_id:
             break
 
