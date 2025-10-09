@@ -32,20 +32,17 @@ def get_tokenizer(
     raise NotImplementedError
 
 EXT_PAT = None
-EXT_split_pattern = None
 EXT_input_path = None
 EXT_special_tokens_len = 0
 
 def init_worker(
     PAT: str, 
-    split_pattern: str, 
     input_path: str,
     special_tokens_len: int
 ):
-    global EXT_PAT, EXT_split_pattern, EXT_input_path, EXT_special_tokens_len
+    global EXT_PAT, EXT_input_path, EXT_special_tokens_len
 
     EXT_PAT = regex.compile(PAT)
-    EXT_split_pattern = regex.compile(split_pattern) if split_pattern else None
     EXT_input_path = input_path
     EXT_special_tokens_len = special_tokens_len
 
@@ -54,22 +51,19 @@ def byte2id(byte: int):
 
 def build_corpus_worker(args):
     start, end = args
-    corpus, docs = [], []
+    corpus = []
 
     with open(EXT_input_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    # Run pre-tokenization on your chunk and store the counts for each pre-token
-    docs = EXT_split_pattern.split(chunk) if EXT_split_pattern else [chunk]
-
-    for doc in docs:
-        for m in EXT_PAT.finditer(doc):
-            b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
-            id_seq = [byte2id(byte) for byte in b]
-            
-            if id_seq:
-                corpus.append(id_seq)
+    # Run pre-tokenization on the chunk
+    for m in EXT_PAT.finditer(chunk):
+        b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
+        id_seq = [byte2id(byte) for byte in b]
+        
+        if id_seq:
+            corpus.append(id_seq)
 
     return corpus
 
@@ -117,10 +111,7 @@ def run_train_bpe(
         id_to_bytes[curr_id] = b
         curr_id += 1
     
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+"""
-    split_pattern = "|".join(re.escape(token) for token in special_tokens if token)
-    if not split_pattern:
-        split_pattern = None
+    PAT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
     num_processes = max(4, os.cpu_count() or 1)
 
     with open(input_path, "rb") as f:
@@ -132,7 +123,7 @@ def run_train_bpe(
         with Pool(
             processes=num_processes,
             initializer=init_worker,
-            initargs=(PAT, split_pattern, input_path, len(special_tokens)),
+            initargs=(PAT, input_path, len(special_tokens)),
         ) as pool:
             # unordered: results yielded in completion order, not original input order
             # imap(...): results yielded in input order
@@ -142,13 +133,20 @@ def run_train_bpe(
     # learn merge until vocab_size since merging adds 1 new token into vocab
     while len(id_to_bytes) < vocab_size:
         id_pair_cnts = Counter()
+        u = id_pair_cnts.update
         for seq in corpus:
-            for i in range(len(seq)-1):
-                id_pair_cnts[(seq[i], seq[i+1])] += 1
+            u(zip(seq, seq[1:]))
         if not id_pair_cnts:
             break
 
-        (id_a, id_b), _ = id_pair_cnts.most_common(1)[0]
+        # Find the most common pair, with deterministic tie-breaking
+        # When counts are tied, select lexicographically largest bytes (matching reference)
+        max_count = max(id_pair_cnts.values())
+        best_pair = max(
+            (pair for pair, count in id_pair_cnts.items() if count == max_count),
+            key=lambda p: (id_to_bytes[p[0]], id_to_bytes[p[1]])
+        )
+        id_a, id_b = best_pair
         new_bytes = id_to_bytes[id_a] + id_to_bytes[id_b]
         if new_bytes in bytes_to_id:
             break
@@ -160,10 +158,11 @@ def run_train_bpe(
 
         # apply merge
         for i, id_seq in enumerate(corpus):
-            j = 0
+            j, n = 0, len(id_seq)
             new_id_seq = []
-            while j < len(id_seq):
-                if j+1 < len(id_seq) and id_seq[j] == id_a and id_seq[j+1] == id_b:
+
+            while j < n:
+                if j+1 < n and id_seq[j] == id_a and id_seq[j+1] == id_b:
                     new_id_seq.append(new_id)
                     j += 2
                 else:
