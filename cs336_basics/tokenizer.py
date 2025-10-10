@@ -33,17 +33,20 @@ def get_tokenizer(
 
 EXT_PAT = None
 EXT_input_path = None
+EXT_split_pattern = None
 EXT_special_tokens_len = 0
 
 def init_worker(
     PAT: str, 
+    split_pattern: str,
     input_path: str,
     special_tokens_len: int
 ):
-    global EXT_PAT, EXT_input_path, EXT_special_tokens_len
+    global EXT_PAT, EXT_split_pattern, EXT_input_path, EXT_special_tokens_len
 
     EXT_PAT = regex.compile(PAT)
     EXT_input_path = input_path
+    EXT_split_pattern = regex.compile(split_pattern) if split_pattern else None
     EXT_special_tokens_len = special_tokens_len
 
 def byte2id(byte: int):
@@ -57,15 +60,74 @@ def build_corpus_worker(args):
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
+    if EXT_split_pattern:
+        docs = EXT_split_pattern.split(chunk)
+    else:
+        docs = [chunk]
+
     # Run pre-tokenization on the chunk
-    for m in EXT_PAT.finditer(chunk):
-        b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
-        id_seq = [byte2id(byte) for byte in b]
-        
-        if id_seq:
-            corpus.append(id_seq)
+    for doc in docs:
+        for m in EXT_PAT.finditer(doc):
+            b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
+            id_seq = [byte2id(byte) for byte in b]
+            
+            if id_seq:
+                corpus.append(id_seq)
 
     return corpus
+
+def apply_merge(
+    corpus: list[list[int]],
+    id_pair_cnts: Counter,
+    new_id: int,    # AB
+    id_a: int,      # A
+    id_b: int,      # B
+):
+    # When you merge tokens (A, B) → AB in a sequence like [..., X, A, B, Y, ...]:
+    # Remove these pairs: (X, A), (A, B), (B, Y)
+    # Add these new pairs: (X, AB), (AB, Y)
+    for i, id_seq in enumerate(corpus):
+        if id_a not in id_seq:
+            continue
+        
+        j, n = 0, len(id_seq)
+        new_id_seq = []
+
+        while j < n:
+            if j+1 < n and id_seq[j] == id_a and id_seq[j+1] == id_b:
+                prev_id : int = None
+                next_id : int = None
+
+                if len(new_id_seq) > 0: # if prev_id exists, delete (X, A)
+                    prev_id = new_id_seq[-1]
+                    id_pair_cnts[(prev_id, id_a)] -= 1
+                    if id_pair_cnts[(prev_id, id_a)] == 0:
+                        del id_pair_cnts[(prev_id, id_a)]
+                
+                if j+2 < len(id_seq): # if next_id exists, skips B & get next_id, delete (B, Y)
+                    next_id = id_seq[j+2]
+                    id_pair_cnts[(id_b, next_id)] -= 1
+                    if id_pair_cnts[(id_b, next_id)] == 0:
+                        del id_pair_cnts[(id_b, next_id)]
+                
+                # delete (A, B)
+                id_pair_cnts[(id_a, id_b)] -= 1
+                if id_pair_cnts[(id_a, id_b)] == 0:
+                    del id_pair_cnts[(id_a, id_b)]
+                
+                # add (X, AB) & (AB, Y)
+                if prev_id is not None:
+                    id_pair_cnts[(prev_id, new_id)] += 1
+                if next_id is not None:
+                    id_pair_cnts[(new_id, next_id)] += 1
+
+                new_id_seq.append(new_id)
+                j += 2
+            else:
+                new_id_seq.append(id_seq[j])
+                j += 1
+        
+        corpus[i] = new_id_seq
 
 def run_train_bpe(
     input_path: str | os.PathLike,
@@ -112,6 +174,10 @@ def run_train_bpe(
         curr_id += 1
     
     PAT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    split_pattern = "|".join(re.escape(token) for token in special_tokens if token)
+    if not split_pattern:
+        split_pattern = None
+    
     num_processes = max(4, os.cpu_count() or 1)
 
     with open(input_path, "rb") as f:
@@ -123,30 +189,30 @@ def run_train_bpe(
         with Pool(
             processes=num_processes,
             initializer=init_worker,
-            initargs=(PAT, input_path, len(special_tokens)),
+            initargs=(PAT, split_pattern, input_path, len(special_tokens)),
         ) as pool:
             # unordered: results yielded in completion order, not original input order
             # imap(...): results yielded in input order
             for seqs in pool.imap_unordered(build_corpus_worker, num_jobs, chunksize=1):
                 corpus.extend(seqs)
     
-    # learn merge until vocab_size since merging adds 1 new token into vocab
+    id_pair_cnts = Counter()
+    for seq in corpus:
+        for i in range(len(seq) - 1):
+            id_pair_cnts[(seq[i], seq[i+1])] += 1
+
+    # learn merge until vocab_size, since merging adds 1 new token into vocab
     while len(id_to_bytes) < vocab_size:
-        id_pair_cnts = Counter()
-        u = id_pair_cnts.update
-        for seq in corpus:
-            u(zip(seq, seq[1:]))
         if not id_pair_cnts:
             break
 
-        # Find the most common pair, with deterministic tie-breaking
+        # Find the highest freq pair, with deterministic tie-breaking
         # When counts are tied, select lexicographically largest bytes (matching reference)
         max_count = max(id_pair_cnts.values())
-        best_pair = max(
+        id_a, id_b = max(
             (pair for pair, count in id_pair_cnts.items() if count == max_count),
             key=lambda p: (id_to_bytes[p[0]], id_to_bytes[p[1]])
         )
-        id_a, id_b = best_pair
         new_bytes = id_to_bytes[id_a] + id_to_bytes[id_b]
         if new_bytes in bytes_to_id:
             break
@@ -156,18 +222,6 @@ def run_train_bpe(
         bytes_to_id[new_bytes] = new_id
         merges.append((id_to_bytes[id_a], id_to_bytes[id_b]))
 
-        # apply merge
-        for i, id_seq in enumerate(corpus):
-            j, n = 0, len(id_seq)
-            new_id_seq = []
-
-            while j < n:
-                if j+1 < n and id_seq[j] == id_a and id_seq[j+1] == id_b:
-                    new_id_seq.append(new_id)
-                    j += 2
-                else:
-                    new_id_seq.append(id_seq[j])
-                    j += 1
-            corpus[i] = new_id_seq
+        apply_merge(corpus, id_pair_cnts, new_id, id_a, id_b)
 
     return id_to_bytes, merges
