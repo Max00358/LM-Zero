@@ -1,7 +1,7 @@
 import os, re
-import regex
 from .pretokenization_example import find_chunk_boundaries
 
+from pathlib import Path
 from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
@@ -44,9 +44,9 @@ def init_worker(
 ):
     global EXT_PAT, EXT_split_pattern, EXT_input_path, EXT_special_tokens_len
 
-    EXT_PAT = regex.compile(PAT)
+    EXT_PAT = re.compile(PAT)
     EXT_input_path = input_path
-    EXT_split_pattern = regex.compile(split_pattern) if split_pattern else None
+    EXT_split_pattern = re.compile(split_pattern) if split_pattern else None
     EXT_special_tokens_len = special_tokens_len
 
 def byte2id(byte: int):
@@ -173,7 +173,11 @@ def run_train_bpe(
         id_to_bytes[curr_id] = b
         curr_id += 1
     
-    PAT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    # Pattern converted from regex to re:
+        # \p{L} (letters) → [^\W\d_] (word chars excluding digits and underscore)
+        # \p{N} (numbers) → \d
+        # [^\s\p{L}\p{N}] (not space/letter/number) → [^\s\w] (not space/word)
+    PAT = r"""'s|'t|'re|'ve|'m|'ll|'d| ?[^\W\d_]+| ?\d+| ?[^\s\w]+|\s+(?!\S)|\s+"""
     split_pattern = "|".join(re.escape(token) for token in special_tokens if token)
     if not split_pattern:
         split_pattern = None
@@ -225,3 +229,32 @@ def run_train_bpe(
         apply_merge(corpus, id_pair_cnts, new_id, id_a, id_b)
 
     return id_to_bytes, merges
+
+def save_bpe(
+    id_to_bytes: dict[int, bytes],
+    merges: list[tuple[bytes, bytes]],
+    output_path: str
+):
+    # vocab.json: { "0": "xx", "1": "20", ... } (ids as strings, bytes as hex)
+    vocab_json = {str(i) : id_to_bytes[i].hex() for i in range(len(id_to_bytes))}
+    (Path(output_path) / "vocab.json").write_text(json.dumps(vocab_json))
+
+    merges_json = [[x.hex(), y.hex()] for x, y in merges]
+    (Path(output_path) / "merges.json").write_text(json.dumps(merges_json))
+
+def vocab_info(
+    id_to_bytes: dict[int, bytes],
+):
+    # longest token by byte len
+    longest_id, longest_bytes = max(id_to_bytes.items(), key=lambda x: len(x[1]))
+
+    try: 
+        longest_bytes_utf8 = longest_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        longest_bytes_utf8 = None
+
+    print (
+        f"longest_id: {longest_id}",
+        f"longest_bytes_len: {len(longest_bytes)}",
+        f"longest_bytes_utf8: {longest_bytes_utf8 if longest_bytes_utf8 is not None else '<non-utf8>'}"
+    )
