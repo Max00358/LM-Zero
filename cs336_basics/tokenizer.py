@@ -1,11 +1,15 @@
 import os, re
+import json
+
 from .pretokenization_example import find_chunk_boundaries
+from tests.common import gpt2_bytes_to_unicode
 
 from pathlib import Path
 from collections import Counter
 from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
 
 # uv run python -m cProfile -o profile.stats -m pytest
 # uv run python -c "import pstats; p = pstats.Stats('profile.stats'); p.sort_stats('cumulative').print_stats(30)"
@@ -202,31 +206,34 @@ def run_train_bpe(
     
     id_pair_cnts = Counter()
     for seq in corpus:
-        for i in range(len(seq) - 1):
-            id_pair_cnts[(seq[i], seq[i+1])] += 1
+        id_pair_cnts.update(zip(seq, seq[1:]))
 
     # learn merge until vocab_size, since merging adds 1 new token into vocab
-    while len(id_to_bytes) < vocab_size:
-        if not id_pair_cnts:
-            break
+    num_merges = vocab_size - len(id_to_bytes)
 
-        # Find the highest freq pair, with deterministic tie-breaking
-        # When counts are tied, select lexicographically largest bytes (matching reference)
-        max_count = max(id_pair_cnts.values())
-        id_a, id_b = max(
-            (pair for pair, count in id_pair_cnts.items() if count == max_count),
-            key=lambda p: (id_to_bytes[p[0]], id_to_bytes[p[1]])
-        )
-        new_bytes = id_to_bytes[id_a] + id_to_bytes[id_b]
-        if new_bytes in bytes_to_id:
-            break
+    with tqdm(total=num_merges, desc="Merging tokens...", unit="merge") as pbar:
+        while len(id_to_bytes) < vocab_size:
+            if not id_pair_cnts:
+                break
 
-        new_id = len(id_to_bytes)
-        id_to_bytes[new_id] = new_bytes
-        bytes_to_id[new_bytes] = new_id
-        merges.append((id_to_bytes[id_a], id_to_bytes[id_b]))
+            # Find the highest freq pair, with deterministic tie-breaking
+            # When counts are tied, select lexicographically largest bytes (matching reference)
+            max_count = max(id_pair_cnts.values())
+            id_a, id_b = max(
+                (pair for pair, count in id_pair_cnts.items() if count == max_count),
+                key=lambda p: (id_to_bytes[p[0]], id_to_bytes[p[1]])
+            )
+            new_bytes = id_to_bytes[id_a] + id_to_bytes[id_b]
+            if new_bytes in bytes_to_id:
+                break
 
-        apply_merge(corpus, id_pair_cnts, new_id, id_a, id_b)
+            new_id = len(id_to_bytes)
+            id_to_bytes[new_id] = new_bytes
+            bytes_to_id[new_bytes] = new_id
+            merges.append((id_to_bytes[id_a], id_to_bytes[id_b]))
+
+            apply_merge(corpus, id_pair_cnts, new_id, id_a, id_b)
+            pbar.update(1)
 
     return id_to_bytes, merges
 
@@ -235,12 +242,26 @@ def save_bpe(
     merges: list[tuple[bytes, bytes]],
     output_path: str
 ):
-    # vocab.json: { "0": "xx", "1": "20", ... } (ids as strings, bytes as hex)
-    vocab_json = {str(i) : id_to_bytes[i].hex() for i in range(len(id_to_bytes))}
-    (Path(output_path) / "vocab.json").write_text(json.dumps(vocab_json))
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
 
-    merges_json = [[x.hex(), y.hex()] for x, y in merges]
-    (Path(output_path) / "merges.json").write_text(json.dumps(merges_json))
+    byte_encoder = gpt2_bytes_to_unicode()
+    vocab = {}
+    for token_id, token_bytes in id_to_bytes.items():
+        # byte_encoder converts bytes to utf-8 strings, 20746865 -> "the"
+        token_str = "".join(byte_encoder[byte] for byte in token_bytes)
+        vocab[token_str] = token_id
+    
+    with open(output_path / "vocab.json", "w", encoding="utf-8") as f:
+        json.dump(vocab, f, ensure_ascii=False, indent=2)
+    
+    with open(output_path / "merges.txt", "w", encoding="utf-8") as f:
+        for x, y in merges:
+            x_str = "".join(byte_encoder[byte] for byte in x)
+            y_str = "".join(byte_encoder[byte] for byte in y)
+            f.write(f"{x_str} {y_str}\n")
+    
+    print(f"✓ Saved vocab ({len(vocab)} tokens) and merges ({len(merges)}) to {output_path}")
 
 def vocab_info(
     id_to_bytes: dict[int, bytes],
@@ -254,7 +275,8 @@ def vocab_info(
         longest_bytes_utf8 = None
 
     print (
-        f"longest_id: {longest_id}",
-        f"longest_bytes_len: {len(longest_bytes)}",
-        f"longest_bytes_utf8: {longest_bytes_utf8 if longest_bytes_utf8 is not None else '<non-utf8>'}"
+        f"\n\t========== Vocab Info ==========\n",
+        f"\tLongest ID: {longest_id}\n",
+        f"\tLongest Bytes Length: {len(longest_bytes)}\n",
+        f"\tLongest Bytes UTF-8: {longest_bytes_utf8 if longest_bytes_utf8 is not None else '<non-utf8>'}\n"
     )

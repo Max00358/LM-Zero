@@ -3,6 +3,7 @@ import time
 
 from .adapters import run_train_bpe
 from .common import FIXTURES_PATH, gpt2_bytes_to_unicode
+from cs336_basics.tokenizer import save_bpe, vocab_info
 
 
 def test_train_bpe_speed():
@@ -15,12 +16,16 @@ def test_train_bpe_speed():
     """
     input_path = FIXTURES_PATH / "corpus.en"
     start_time = time.time()
-    _, _ = run_train_bpe(
+    id_to_bytes, merges = run_train_bpe(
         input_path=input_path,
         vocab_size=500,
         special_tokens=["<|endoftext|>"],
     )
     end_time = time.time()
+
+    # save_bpe(id_to_bytes, merges, FIXTURES_PATH.parent.parent / "data" / "train_bpe_speed_bpe")
+    # vocab_info(id_to_bytes)
+
     assert end_time - start_time < 1.5
 
 
@@ -86,3 +91,18 @@ def test_train_bpe_special_tokens(snapshot):
             "merges": merges,
         },
     )
+
+# def test_bpe_tinystories():
+#     input_path = FIXTURES_PATH.parent.parent / "data" / "TinyStoriesV2-GPT4-train.txt"
+
+#     t0 = time.time()
+#     id_to_bytes, merges = run_train_bpe(
+#         input_path=input_path,
+#         vocab_size=10000,
+#         special_tokens=["<|endoftext|>"],
+#     )
+#     t1 = time.time()
+#     print(f"(test_bpe_tinystories) Time taken: {t1 - t0} seconds")
+
+#     save_bpe(id_to_bytes, merges, FIXTURES_PATH.parent.parent / "data" / "tinystories_bpe")
+#     vocab_info(id_to_bytes)
