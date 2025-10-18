@@ -1,5 +1,6 @@
 import os, re
 import json
+import numpy as np
 
 from .pretokenization_example import find_chunk_boundaries
 from tests.common import gpt2_bytes_to_unicode
@@ -53,9 +54,6 @@ def init_worker(
     EXT_split_pattern = re.compile(split_pattern) if split_pattern else None
     EXT_special_tokens_len = special_tokens_len
 
-def byte2id(byte: int):
-    return EXT_special_tokens_len + byte
-
 def build_corpus_worker(args):
     start, end = args
     corpus = []
@@ -73,8 +71,10 @@ def build_corpus_worker(args):
     for doc in docs:
         for m in EXT_PAT.finditer(doc):
             b = m.group(0).encode("utf-8") # find exact substr & convert to utf-8 range 0 ~ 255
-            id_seq = [byte2id(byte) for byte in b]
             
+            arr = np.frombuffer(b, dtype=np.uint8)
+            id_seq = (EXT_special_tokens_len + arr).tolist()
+            # id_seq = [EXT_special_tokens_len + byte for byte in b] # convert byte to id
             if id_seq:
                 corpus.append(id_seq)
 
