@@ -8,12 +8,98 @@ from tests.common import gpt2_bytes_to_unicode
 from pathlib import Path
 from collections import Counter
 from collections.abc import Iterable
-from typing import IO, Any, BinaryIO
+from typing import IO, Any, BinaryIO, Iterator
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 # uv run python -m cProfile -o profile.stats -m pytest
 # uv run python -c "import pstats; p = pstats.Stats('profile.stats'); p.sort_stats('cumulative').print_stats(30)"
+
+BYTE_DECODER = {v: k for k, v in gpt2_bytes_to_unicode().items()}
+
+class tokenizer:
+    def __init__(
+            self, 
+            vocab: dict[int, bytes], 
+            merges: list[tuple[bytes, bytes]], 
+            special_tokens: list[str] | None = None
+        ):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+
+    # Constructs and return a Tokenizer from a serialized vocabulary and list of merges
+    @classmethod
+    def from_files(
+        # class, require @classmethod for Python to recognize it, else it will be treated as a regular arg
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None
+    ):
+        vocab_filepath = Path(vocab_filepath)
+        merges_filepath = Path(merges_filepath)
+
+        if not vocab_filepath.exists():
+            raise FileNotFoundError(f"Vocab file not found: {vocab_filepath}")
+        if not merges_filepath.exists():
+            raise FileNotFoundError(f"Merges file not found: {merges_filepath}")
+
+        vocab = cls._load_vocab(vocab_filepath)     # id2bytes
+        merges = cls._load_merges(merges_filepath)  # (bytes & bytes)
+        return cls(
+            vocab, 
+            merges,
+            special_tokens
+        )
+
+    @staticmethod # no self or cls
+    def _load_vocab(vocab_filepath: Path):
+        id_to_bytes: dict[int, bytes] = {}
+
+        text = vocab_filepath.read_text(encoding="utf-8", errors="ignore")
+        data = json.loads(text)
+
+        for token_str, token_id in data.items():
+            token_id = int(token_id)
+            token_bytes = bytes([BYTE_DECODER[byte] for byte in token_str])
+            id_to_bytes[token_id] = token_bytes
+
+        return id_to_bytes
+    
+    @staticmethod
+    def _load_merges(merges_filepath: Path):
+        merges: list[tuple[bytes, bytes]] = []
+
+        with merges_filepath.open("r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+
+                parts = line.split()
+                if len(parts) != 2:
+                    raise ValueError(f"Bad merges line (need 2 columns): {line}")
+
+                merges.append(
+                    (
+                        bytes([BYTE_DECODER[byte] for byte in parts[0]]),
+                        bytes([BYTE_DECODER[byte] for byte in parts[1]])
+                    )
+                )
+        
+        return merges
+
+    def encode(self, text: str) -> list[int]:
+        pass
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        pass
+
+    def decode(self, ids: list[int]) -> str:
+        pass
+
+
 def get_tokenizer(
     vocab: dict[int, bytes],
     merges: list[tuple[bytes, bytes]],
@@ -245,7 +331,7 @@ def save_bpe(
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    byte_encoder = gpt2_bytes_to_unicode()
+    byte_encoder = gpt2_bytes_to_unicode()    
     vocab = {}
     for token_id, token_bytes in id_to_bytes.items():
         # byte_encoder converts bytes to utf-8 strings, 20746865 -> "the"
