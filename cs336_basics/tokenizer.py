@@ -24,9 +24,19 @@ class tokenizer:
             merges: list[tuple[bytes, bytes]], 
             special_tokens: list[str] | None = None
         ):
-        self.vocab = vocab
-        self.merges = merges
+        self.id_to_bytes = vocab
+        self.merges = merges    # (bytes, bytes)
         self.special_tokens = special_tokens
+        
+        self.bytes_to_id = {b: id for id, b in vocab.items()}
+        
+        # (bytes, bytes) -> priority
+        # Merges learned earlier have higher priority (lower index)
+        self.merge_prio = {merge: i for i, merge in enumerate(merges)}
+
+        self.PAT = re.compile(
+            r"""'s|'t|'re|'ve|'m|'ll|'d| ?[^\W\d_]+| ?\d+| ?[^\s\w]+|\s+(?!\S)|\s+"""
+        )
 
     # Constructs and return a Tokenizer from a serialized vocabulary and list of merges
     @classmethod
@@ -89,15 +99,176 @@ class tokenizer:
                 )
         
         return merges
+    
+    # handle cases like: text = "\n\nWorld"
+    def _encode_chunk(self, text: str) -> list[int]:
+        """
+        Encode text into token IDs using BPE merges.
+        
+        Algorithm:
+        1. Start with byte-level tokens (each byte -> its token ID)
+        2. Find the highest priority merge that exists in the sequence
+        3. Apply that merge (replace the pair with merged token)
+        4. Repeat until no more merges can be applied
+        """
+        token_ids = []
 
+        for sub_chunk in self.PAT.finditer(text):
+            # find exact substr, then convert text to bytes, then to token IDs
+            text_bytes = sub_chunk.group(0).encode('utf-8')
+            # Map each byte to its token ID from vocab
+            tokens = [self.bytes_to_id[bytes([b])] for b in text_bytes]
+        
+            while len(tokens) > 1:
+                # Find all consecutive pairs in current tokens
+                pairs = []
+                for i in range(len(tokens) - 1):
+                    # Get the bytes represented by this token pair
+                    bytes_a = self.id_to_bytes[tokens[i]]
+                    bytes_b = self.id_to_bytes[tokens[i + 1]]
+                    pair = (bytes_a, bytes_b)
+                    
+                    # Check if this pair is in our learned merges
+                    if pair in self.merge_prio:
+                        pairs.append((i, pair, self.merge_prio[pair]))
+                
+                if not pairs:
+                    break
+                
+                # Find the pair with highest priority (lowest priority number)
+                # If multiple pairs have same priority, choose the leftmost one (lowest index i)
+                min_priority_pair = min(pairs, key=lambda x: (x[2], x[0]))
+                merge_idx, (bytes_a, bytes_b), _ = min_priority_pair
+                
+                # Get the token ID for the merged bytes
+                merged_bytes = bytes_a + bytes_b
+                merged_token_id = self.bytes_to_id[merged_bytes]
+                
+                # Apply the merge: replace tokens[merge_idx:merge_idx+2] with merged_token_id
+                tokens = tokens[ : merge_idx] + [merged_token_id] + tokens[merge_idx+2 : ]
+            
+            token_ids.extend(tokens)
+
+        return token_ids
+    
+    def _split_on_special_tokens(self, text: str) -> list[tuple[str, bool]]:
+        if not self.special_tokens:
+            return [(text, False)]
+        
+        # sort by length w/ longest first, so that regex tries the longest pattern first
+            # "<|endoftext|><|endoftext|>", "<|endoftext|>" allows for greedy matching
+            # instead of EOTEOT breaking down into 2 EOT, it matches to just 1 element for double EOT
+        sorted_special_tokens = sorted(self.special_tokens, key=len, reverse=True)
+        special_pattern = '|'.join(re.escape(token) for token in sorted_special_tokens)
+        text_parts = re.split(f'({special_pattern})', text)
+
+        res = []
+        special_tokens_set = set(self.special_tokens)
+        for part in text_parts:
+            if part:
+                is_special = bool(part in special_tokens_set)
+                res.append((part, is_special))
+            
+        return res # list of (text_chunk, is_special_token) tuples
+    
+    '''
+    Input: "Hello<|endoftext|>\n\nWorld"
+        ↓
+    Split on special tokens
+        ↓
+    [("Hello", False), ("<|endoftext|>", True), ("\n\nWorld", False)]
+        ↓
+    _encode_chunk("Hello")         → With pre-tokenization!
+        "Hello" → pre-tokenize → ["Hello"]
+        Apply BPE to "Hello" → token_ids ✓
+        
+    _encode_chunk("\n\nWorld")     → With pre-tokenization!
+        "\n\nWorld" → pre-tokenize → ["\n\n", "World"]
+        Apply BPE to "\n\n" separately → [198, 198] ✓
+        Apply BPE to "World" separately → token_ids ✓
+    '''
     def encode(self, text: str) -> list[int]:
-        pass
+        if not self.special_tokens:
+            return self._encode_chunk(text)
+        
+        text_chunks = self._split_on_special_tokens(text)
 
+        token_ids = []
+        for text_chunk, is_special in text_chunks:
+            if is_special: # handle cases like '<endoftext>'
+                special_bytes = text_chunk.encode('utf-8')
+                token_ids.append(self.bytes_to_id[special_bytes])
+            else:
+                if text_chunk:
+                    token_ids.extend(self._encode_chunk(text_chunk))
+        
+        return token_ids
+        
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        pass
+        """
+        Cannot do text = file.read() because file is too large, OOM
+        we read in chunks & process chunks separately
+
+        However, we can face boundary problem, where a single token can be split by these bounds
+        hence we need an overlap strategy.
+        """
+        buffer = ""
+        for text_chunk in iterable:
+            # we must keep saving text until complete special_tokens appear
+            # must not encode when special_tokens are incomplete
+            keep_saving = False
+            buffer += text_chunk
+            
+            if self.special_tokens:
+                for special_token in self.special_tokens:
+                    # len(special_token)-1 b.c if buffer has full special_token then we should just process/encode buffer
+                    for i in range(1, len(special_token)):
+                        if buffer.endswith(special_token[:i]):
+                            keep_saving = True
+                            break
+                    if keep_saving:
+                        break
+                
+                if keep_saving:
+                    continue
+
+            token_ids = self.encode(buffer)
+
+            if len(token_ids) > 0:
+                bytes_to_keep = 0
+                tokens_idx_to_keep = 0
+
+                for i in range(len(token_ids)-1, -1, -1):
+                    bytes_to_keep += len(self.id_to_bytes[token_ids[i]])
+                    tokens_idx_to_keep += 1
+
+                    if bytes_to_keep >= 100: # 100 bytes of tokens as buffer
+                        break
+                
+                # yield from start to -tokens_idx_to_keep
+                tokens_to_yield = token_ids[:-tokens_idx_to_keep] if tokens_idx_to_keep > 0 else []
+                for token_id in tokens_to_yield:
+                    yield token_id
+                
+                # keep the -bytes_to_keep to the end
+                kept_tokens = token_ids[-tokens_idx_to_keep:] if tokens_idx_to_keep > 0 else []
+                buffer = b''.join(self.id_to_bytes[token_id] for token_id in kept_tokens).decode('utf-8', errors='ignore')
+
+        if buffer:
+            remaining_tokens = self.encode(buffer)
+            for token_id in remaining_tokens:
+                yield token_id
 
     def decode(self, ids: list[int]) -> str:
-        pass
+        """
+        Decode token IDs back into text.
+        Simply concatenate the bytes for each token ID and decode as UTF-8 back to string.
+        """
+        # bad_bytes = b'Hello\xff\xfeWorld'
+        # errors='ignore'   => "HelloWorld", invalid bytes silently removed
+        # errors='replace'  => "Hello��World", � is U+FFFD replacement char
+        byte_sequence = b''.join(self.id_to_bytes[token_id] for token_id in ids)
+        return byte_sequence.decode('utf-8', errors='replace')
 
 
 def get_tokenizer(
@@ -120,7 +291,7 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    return tokenizer(vocab, merges, special_tokens)
 
 EXT_PAT = None
 EXT_input_path = None
