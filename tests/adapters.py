@@ -11,7 +11,7 @@ from torch import Tensor
 
 from cs336_basics.tokenizer import run_train_bpe as tokenizer_run_train_bpe
 from cs336_basics.tokenizer import get_tokenizer as tokenizer_get_tokenizer
-from cs336_basics.modules import Linear
+from cs336_basics.modules import Linear, Embedding
 
 def run_linear(
     d_in: int,
@@ -56,7 +56,9 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    embedding_module = Embedding(vocab_size, d_model)
+    embedding_module.load_state_dict({"weight": weights})
+    return embedding_module.forward(token_ids)
 
 
 def run_swiglu(
@@ -305,7 +307,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE Θ parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
