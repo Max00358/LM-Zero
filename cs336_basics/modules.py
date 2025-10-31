@@ -64,3 +64,42 @@ class RMSNorm(nn.Module):
         rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         rms_norm = (x / rms) * self.weight
         return rms_norm.to(in_type)
+
+# position-wise feedforward network
+class SwiGLU(nn.Module):
+    def __init__(
+        self, 
+        d_model: int, 
+        d_ff: int, 
+        device: torch.device | None = None, 
+        dtype: torch.dtype | None = None
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.d_ff = d_ff
+
+        # nn.Linear(in, out) creates weight matrix of shape (out, in)
+        self.w1 = nn.Parameter(
+            torch.empty(d_ff, d_model, device=device, dtype=dtype)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(d_model, d_ff, device=device, dtype=dtype)
+        )
+        self.w3 = nn.Parameter(
+            torch.empty(d_ff, d_model, device=device, dtype=dtype)
+        )
+
+        # init weights
+        nn.init.trunc_normal_(self.w1, std=0.02)
+        nn.init.trunc_normal_(self.w2, std=0.02)
+        nn.init.trunc_normal_(self.w3, std=0.02)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (..., d_model)
+        # w1: (d_ff, d_model)
+        w1x = x @ self.w1.T
+        silu = torch.sigmoid(w1x) * w1x
+        w3x = x @ self.w3.T
+        
+        return (silu * w3x) @ self.w2.T
+
