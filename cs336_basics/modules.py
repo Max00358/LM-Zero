@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from jaxtyping import Float
 
 class Linear(nn.Module):
     def __init__(
@@ -103,6 +104,7 @@ class SwiGLU(nn.Module):
         
         return (silu * w3x) @ self.w2.T
 
+# Relative/Rotational Position Embeddings
 class RoPE(nn.Module):
     def __init__(
         self, 
@@ -145,3 +147,17 @@ class RoPE(nn.Module):
         x_rot = torch.stack([x_even_rot, x_odd_rot], dim=-1).flatten(-2, -1)
 
         return x_rot
+
+def apply_softmax(
+    x: Float[torch.Tensor, " ..."], 
+    dim: int
+) -> Float[torch.Tensor, " ..."]:
+    # keep the dimension of x & subtract every element in x by max_x to normalize it
+    # we subtract max_x instead of min_x because exp(large_x) = inf (unstable) but exp(small_neg_x) = 0
+    max_x = torch.max(x, dim=dim, keepdim=True).values
+    stable_x = x - max_x
+
+    exp_x = torch.exp(stable_x)
+    sum_exp_x = torch.sum(exp_x, dim=dim, keepdim=True)
+
+    return exp_x / sum_exp_x
