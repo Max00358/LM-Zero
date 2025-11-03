@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from jaxtyping import Float
+from jaxtyping import Float, Bool
 
 class Linear(nn.Module):
     def __init__(
@@ -161,3 +161,20 @@ def apply_softmax(
     sum_exp_x = torch.sum(exp_x, dim=dim, keepdim=True)
 
     return exp_x / sum_exp_x
+
+def scaled_dot_product_attention(
+    # Q: ... arbitrary dim, queries dim & d_k dim
+    Q: Float[torch.Tensor, " ... queries d_k"],
+    K: Float[torch.Tensor, " ... keys d_k"],
+    V: Float[torch.Tensor, " ... values d_v"],
+    mask: Bool[torch.Tensor, " ... queries keys"] | None = None
+) -> Float[torch.Tensor, " ... queries d_v"]:
+    d_k = Q.shape[-1]
+    scores = Q @ K.transpose(-2, -1) / (d_k ** 0.5)
+
+    if mask is not None:
+        # masked_fill(mask, value) replaces all values where mask == True, hence we invert mask
+        scores = scores.masked_fill(~mask, float('-inf'))
+    
+    attention_weights = apply_softmax(scores, dim=-1)
+    return attention_weights @ V
