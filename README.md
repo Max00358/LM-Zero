@@ -1,5 +1,3 @@
-# A1: Basics
-
 ## Setup
 
 ### Environment
